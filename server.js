@@ -25,8 +25,13 @@ let db;
 async function initDatabase() {
   const SQL = await initSqlJs();
   
-  // Always start fresh to reset demo data
-  db = new SQL.Database();
+  // Load existing database or create new one
+  if (fs.existsSync(DB_PATH)) {
+    const buffer = fs.readFileSync(DB_PATH);
+    db = new SQL.Database(buffer);
+  } else {
+    db = new SQL.Database();
+  }
   
   // Create tables
   db.run(`
@@ -169,15 +174,19 @@ async function initDatabase() {
   db.run(`CREATE INDEX IF NOT EXISTS idx_leave_medewerker ON leave_requests(medewerker_id)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_notifications_ontvanger ON notifications(ontvanger_id)`);
 
-  // Create default admin user - Bart De Smedt
-  const hash = bcrypt.hashSync('WelkomRooster2026!', 10);
-  db.run(`INSERT INTO users (naam, email, wachtwoord_hash, rol, afdeling) VALUES (?, ?, ?, ?, ?)`,
-    ['Bart De Smedt', 'bart@fidfinance.nl', hash, 'manager', 'Beheer']
-  );
-  
-  saveDatabase();
+  // Create default admin user if none exists
+  const users = db.exec(`SELECT COUNT(*) as count FROM users`);
+  if (users[0].values[0][0] === 0) {
+    // Create admin account for Bart
+    const hash = bcrypt.hashSync('WelkomRooster2026!', 10);
+    db.run(`INSERT INTO users (naam, email, wachtwoord_hash, rol, afdeling) VALUES (?, ?, ?, ?, ?)`,
+      ['Bart De Smedt', 'bart@fidfinance.nl', hash, 'manager', 'Beheer']
+    );
+    
+    saveDatabase();
+  }
 
-  console.log('Database initialized with admin user');
+  console.log('Database initialized');
 }
 
 function saveDatabase() {
@@ -245,6 +254,30 @@ function requireManager(req, res, next) {
 }
 
 // ======= AUTH ROUTES =======
+
+// Setup initial admin account (only works if no users exist)
+app.post('/api/auth/setup-admin', async (req, res) => {
+  try {
+    const { email, password, naam } = req.body;
+    
+    // Check if any users exist
+    const userCount = dbGet('SELECT COUNT(*) as count FROM users');
+    if (userCount && userCount.count > 0) {
+      return res.status(400).json({ error: 'Er bestaat al een admin account' });
+    }
+    
+    const hash = bcrypt.hashSync(password, 10);
+    dbRun(
+      'INSERT INTO users (naam, email, wachtwoord_hash, rol, afdeling) VALUES (?, ?, ?, ?, ?)',
+      [naam, email, hash, 'manager', 'Beheer']
+    );
+    
+    res.json({ message: 'Admin account aangemaakt', email });
+  } catch (error) {
+    console.error('Setup admin error:', error);
+    res.status(500).json({ error: 'Fout bij aanmaken admin' });
+  }
+});
 
 app.post('/api/auth/login', async (req, res) => {
   try {
@@ -352,12 +385,12 @@ app.post('/api/invitations', authenticateToken, requireManager, (req, res) => {
     const vervaltOp = new Date();
     vervaltOp.setDate(vervaltOp.getDate() + 7); // Valid for 7 days
     
-    const result = dbRun(
+    dbRun(
       'INSERT INTO invitations (email, naam, token, rol, afdeling, vervalt_op, aangemaakt_door) VALUES (?, ?, ?, ?, ?, ?, ?)',
       [email, naam, token, rol || 'medewerker', afdeling, vervaltOp.toISOString(), req.user.id]
     );
     
-    const invitation = dbGet('SELECT * FROM invitations WHERE id = ?', [result.lastID]);
+    const invitation = dbGet('SELECT * FROM invitations WHERE token = ?', [token]);
     res.status(201).json({
       ...invitation,
       link: `${process.env.FRONTEND_URL || 'https://rooster-planning.netlify.app'}/registreer/${token}`
@@ -447,7 +480,7 @@ app.post('/api/register', (req, res) => {
     
     // Create user
     const hash = bcrypt.hashSync(wachtwoord, 10);
-    const result = dbRun(
+    dbRun(
       'INSERT INTO users (naam, email, wachtwoord_hash, rol, afdeling) VALUES (?, ?, ?, ?, ?)',
       [invitation.naam, invitation.email, hash, invitation.rol, invitation.afdeling]
     );
@@ -455,8 +488,11 @@ app.post('/api/register', (req, res) => {
     // Mark invitation as used
     dbRun('UPDATE invitations SET gebruikt = 1 WHERE id = ?', [invitation.id]);
     
-    // Get created user
-    const user = dbGet('SELECT * FROM users WHERE id = ?', [result.lastID]);
+    // Get created user by email (more reliable than lastID)
+    const user = dbGet('SELECT * FROM users WHERE email = ?', [invitation.email]);
+    if (!user) {
+      return res.status(500).json({ error: 'Account aangemaakt maar kon niet worden opgehaald' });
+    }
     delete user.wachtwoord_hash;
     
     // Create JWT token so user is logged in immediately
@@ -503,12 +539,12 @@ app.post('/api/users', authenticateToken, requireManager, (req, res) => {
     }
     
     const hash = bcrypt.hashSync(wachtwoord, 10);
-    const result = dbRun(
+    dbRun(
       'INSERT INTO users (naam, email, wachtwoord_hash, rol, afdeling, vakantiesaldo) VALUES (?, ?, ?, ?, ?, ?)',
       [naam, email, hash, rol || 'medewerker', afdeling, vakantiesaldo || 25]
     );
     
-    const user = dbGet('SELECT * FROM users WHERE id = ?', [result.lastID]);
+    const user = dbGet('SELECT * FROM users WHERE email = ?', [email]);
     delete user.wachtwoord_hash;
     res.status(201).json(user);
   } catch (error) {
@@ -593,12 +629,12 @@ app.post('/api/shifts', authenticateToken, requireManager, (req, res) => {
   try {
     const { medewerker_id, datum, starttijd, eindtijd, pauze, afdeling, status, notities } = req.body;
     
-    const result = dbRun(
+    dbRun(
       'INSERT INTO shifts (medewerker_id, datum, starttijd, eindtijd, pauze, afdeling, status, notities) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
       [medewerker_id, datum, starttijd, eindtijd, pauze || 0, afdeling, status || 'concept', notities]
     );
     
-    const shift = dbGet('SELECT s.*, u.naam as medewerker_naam FROM shifts s JOIN users u ON s.medewerker_id = u.id WHERE s.id = ?', [result.lastID]);
+    const shift = dbGet('SELECT s.*, u.naam as medewerker_naam FROM shifts s JOIN users u ON s.medewerker_id = u.id WHERE s.medewerker_id = ? AND s.datum = ? AND s.starttijd = ? ORDER BY s.id DESC LIMIT 1', [medewerker_id, datum, starttijd]);
     res.status(201).json(shift);
   } catch (error) {
     res.status(500).json({ error: 'Fout bij aanmaken dienst' });
@@ -721,12 +757,12 @@ app.post('/api/time-registrations/checkin', authenticateToken, (req, res) => {
       [req.user.id, datum]
     );
     
-    const result = dbRun(
+    dbRun(
       'INSERT INTO time_registrations (medewerker_id, shift_id, datum, inchecktijd) VALUES (?, ?, ?, ?)',
       [req.user.id, shift?.id || null, datum, tijd]
     );
     
-    const registration = dbGet('SELECT * FROM time_registrations WHERE id = ?', [result.lastID]);
+    const registration = dbGet('SELECT * FROM time_registrations WHERE medewerker_id = ? AND datum = ? ORDER BY id DESC LIMIT 1', [req.user.id, datum]);
     res.status(201).json(registration);
   } catch (error) {
     res.status(500).json({ error: 'Fout bij inchecken' });
@@ -769,12 +805,12 @@ app.post('/api/time-registrations', authenticateToken, (req, res) => {
       [req.user.id, datum]
     );
     
-    const result = dbRun(
+    dbRun(
       'INSERT INTO time_registrations (medewerker_id, shift_id, datum, inchecktijd, uitchecktijd, pauze_minuten, notities) VALUES (?, ?, ?, ?, ?, ?, ?)',
       [req.user.id, shift?.id || null, datum, inchecktijd, uitchecktijd, pauze_minuten || 0, notities]
     );
     
-    const registration = dbGet('SELECT * FROM time_registrations WHERE id = ?', [result.lastID]);
+    const registration = dbGet('SELECT * FROM time_registrations WHERE medewerker_id = ? AND datum = ? ORDER BY id DESC LIMIT 1', [req.user.id, datum]);
     res.status(201).json(registration);
   } catch (error) {
     res.status(500).json({ error: 'Fout bij registreren uren' });
@@ -878,7 +914,7 @@ app.post('/api/leave-requests', authenticateToken, (req, res) => {
       }
     }
     
-    const result = dbRun(
+    dbRun(
       'INSERT INTO leave_requests (medewerker_id, begindatum, einddatum, type, opmerking, aantal_dagen) VALUES (?, ?, ?, ?, ?, ?)',
       [req.user.id, begindatum, einddatum, type, opmerking, days]
     );
@@ -892,7 +928,7 @@ app.post('/api/leave-requests', authenticateToken, (req, res) => {
       );
     }
     
-    const request = dbGet('SELECT * FROM leave_requests WHERE id = ?', [result.lastID]);
+    const request = dbGet('SELECT * FROM leave_requests WHERE medewerker_id = ? ORDER BY id DESC LIMIT 1', [req.user.id]);
     res.status(201).json(request);
   } catch (error) {
     res.status(500).json({ error: 'Fout bij indienen aanvraag' });
@@ -983,12 +1019,12 @@ app.post('/api/availability', authenticateToken, (req, res) => {
       [req.user.id, dag_van_week, type || 'vast']
     );
     
-    const result = dbRun(
+    dbRun(
       'INSERT INTO availability (medewerker_id, dag_van_week, beschikbaar_van, beschikbaar_tot, beschikbaar, type, datum) VALUES (?, ?, ?, ?, ?, ?, ?)',
       [req.user.id, dag_van_week, beschikbaar_van, beschikbaar_tot, beschikbaar ? 1 : 0, type || 'vast', datum]
     );
     
-    const availability = dbGet('SELECT * FROM availability WHERE id = ?', [result.lastID]);
+    const availability = dbGet('SELECT * FROM availability WHERE medewerker_id = ? AND dag_van_week = ? ORDER BY id DESC LIMIT 1', [req.user.id, dag_van_week]);
     res.status(201).json(availability);
   } catch (error) {
     res.status(500).json({ error: 'Fout bij opslaan beschikbaarheid' });
@@ -1036,7 +1072,7 @@ app.post('/api/shift-swaps', authenticateToken, (req, res) => {
   try {
     const { shift_aanvrager_id, ontvanger_id, opmerking } = req.body;
     
-    const result = dbRun(
+    dbRun(
       'INSERT INTO shift_swaps (aanvrager_id, ontvanger_id, shift_aanvrager_id, opmerking) VALUES (?, ?, ?, ?)',
       [req.user.id, ontvanger_id, shift_aanvrager_id, opmerking]
     );
@@ -1047,7 +1083,7 @@ app.post('/api/shift-swaps', authenticateToken, (req, res) => {
       [ontvanger_id, 'dienstruil', 'Nieuw ruilverzoek', 'Je hebt een nieuw ruilverzoek ontvangen.', '/dienstruil']
     );
     
-    const swap = dbGet('SELECT * FROM shift_swaps WHERE id = ?', [result.lastID]);
+    const swap = dbGet('SELECT * FROM shift_swaps WHERE aanvrager_id = ? ORDER BY id DESC LIMIT 1', [req.user.id]);
     res.status(201).json(swap);
   } catch (error) {
     res.status(500).json({ error: 'Fout bij aanmaken ruilverzoek' });
